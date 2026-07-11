@@ -111,6 +111,8 @@ pip3 install frida frida-tools
 
 - **[wx-favorites-report](https://github.com/zhuyansen/wx-favorites-report)** — 微信收藏可视化工具，本项目的 frida hook 密钥提取方法（`CCKeyDerivationPBKDF` 拦截）和 SQLCipher 4 解密逻辑参考了该项目的实现
 
+早期版本的脚本结构参考过 [mcncarl/yichen-skills](https://github.com/mcncarl/yichen-skills) 中 `wechat-local-vault` skill 的思路，后续密钥提取、联系人列表、日报解析三个脚本均已重写。
+
 ## 文件结构
 
 ```

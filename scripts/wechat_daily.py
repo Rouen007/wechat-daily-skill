@@ -128,7 +128,8 @@ def load_keys():
         return json.load(f)
 
 
-def decrypt_db(db_path, key_hex, out_path):
+def decrypt_sqlcipher_db(db_path, key_hex, out_path):
+    """SQLCipher 4 分页解密算法致谢 zhuyansen/wx-favorites-report（MIT License），见 README 致谢。"""
     key = bytes.fromhex(key_hex)
     with open(db_path, "rb") as f:
         data = f.read()
@@ -154,7 +155,7 @@ def decrypt_db(db_path, key_hex, out_path):
         f.write(result)
 
 
-def get_contact_map(db_path):
+def load_display_names(db_path):
     db = sqlite3.connect(db_path)
     contacts = {}
     for row in db.execute("SELECT userName, remark, nick_name FROM contact"):
@@ -163,7 +164,7 @@ def get_contact_map(db_path):
     return contacts
 
 
-def get_hash_map(db_path):
+def load_table_hash_index(db_path):
     db = sqlite3.connect(db_path)
     mapping = {}
     for row in db.execute("SELECT user_name FROM Name2Id"):
@@ -307,7 +308,7 @@ def decrypt_databases_cached(db_base):
                 pass
 
         print(f"  解密 {name}...")
-        decrypt_db(src_path, key_hex, cache_path)
+        decrypt_sqlcipher_db(src_path, key_hex, cache_path)
         with open(stamp_path, "w") as f:
             f.write(today)
 
@@ -525,8 +526,8 @@ def list_all_chats(config):
 
     decrypt_databases_cached(db_base)
 
-    contacts = get_contact_map(os.path.join(CACHE_DIR, "contact.db"))
-    hash_map = get_hash_map(os.path.join(CACHE_DIR, "message_0.db"))
+    contacts = load_display_names(os.path.join(CACHE_DIR, "contact.db"))
+    hash_map = load_table_hash_index(os.path.join(CACHE_DIR, "message_0.db"))
     db = sqlite3.connect(os.path.join(CACHE_DIR, "message_0.db"))
 
     week_ago = int((datetime.now() - timedelta(days=7)).timestamp())
@@ -704,8 +705,8 @@ def _extract_and_report(config, start_ts, end_ts, target_date):
         print(f"解析缓存未命中，解密数据库...")
         decrypt_databases_cached(get_db_base(config))
 
-        contacts = get_contact_map(os.path.join(CACHE_DIR, "contact.db"))
-        hash_map = get_hash_map(os.path.join(CACHE_DIR, "message_0.db"))
+        contacts = load_display_names(os.path.join(CACHE_DIR, "contact.db"))
+        hash_map = load_table_hash_index(os.path.join(CACHE_DIR, "message_0.db"))
         db = sqlite3.connect(os.path.join(CACHE_DIR, "message_0.db"))
 
         chat_stats, _ = collect_messages(db, contacts, hash_map, start_ts=start_ts, end_ts=end_ts)

@@ -1,372 +1,276 @@
 #!/usr/bin/env python3
 """
-微信 Mac 4.x 数据库密钥提取工具
-使用 frida hook CCKeyDerivationPBKDF 捕获所有数据库的加密密钥
+微信 Mac 4.x SQLCipher 密钥提取。
+
+技术原理（致谢 zhuyansen/wx-favorites-report，MIT License，见 README 致谢）：
+微信 Mac 4.x 用 SQLCipher 4 加密本地数据库，密钥经系统 CommonCrypto 的
+CCKeyDerivationPBKDF（PBKDF2）派生。用 frida hook 该函数即可在微信启动时
+拿到每个数据库对应的 (salt, derived_key) 对，再用 salt 精确匹配到具体
+db 文件——SQLCipher 4 的 salt 就是 db 文件开头 16 字节（未加密）。
 """
 
-import os
-import sys
-import json
 import glob
-import subprocess
-import time
+import json
+import os
 import shutil
+import subprocess
+import sys
+import time
 
-KEYS_FILE = os.path.expanduser("~/.config/wechat-keys.json")
-CONFIG_FILE = os.path.expanduser("~/.config/wechat-daily.json")
-WECHAT_APP = "/Applications/WeChat.app"
-WECHAT_COPY = os.path.expanduser("~/Desktop/WeChat.app")
-FRIDA_LOG = "/tmp/wechat_frida_keys.log"
-WECHAT_BASE = os.path.expanduser(
+CONFIG_DIR = os.path.expanduser("~/.config")
+KEYS_FILE = os.path.join(CONFIG_DIR, "wechat-keys.json")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "wechat-daily.json")
+
+APP_ORIGINAL = "/Applications/WeChat.app"
+APP_RESIGNED = os.path.expanduser("~/Desktop/WeChat.app")
+CAPTURE_LOG = "/tmp/wechat_daily_pbkdf2.jsonl"
+
+CONTAINER_ROOT = os.path.expanduser(
     "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
 )
 
-# Frida JS hook script — 拦截 CCKeyDerivationPBKDF (Apple CommonCrypto PBKDF2)
-FRIDA_JS = r"""
-'use strict';
-
-var CCKeyDerivationPBKDF = null;
-
-Process.enumerateModules().forEach(function(mod) {
-    try {
-        var exp = mod.enumerateExports();
-        for (var i = 0; i < exp.length; i++) {
-            if (exp[i].name === 'CCKeyDerivationPBKDF') {
-                CCKeyDerivationPBKDF = exp[i].address;
-                break;
-            }
-        }
-    } catch (e) {}
-    if (CCKeyDerivationPBKDF) return;
-});
-
-if (!CCKeyDerivationPBKDF) {
-    send({type: 'error', msg: 'CCKeyDerivationPBKDF not found'});
-    return;
+# db 文件名 -> 是否是日报流程需要的密钥
+TARGET_DBS = {
+    "message_0": "message/message_0.db",
+    "contact": "contact/contact.db",
+    "session": "session/session.db",
 }
 
-send({type: 'status', msg: 'Hooked CCKeyDerivationPBKDF at ' + CCKeyDerivationPBKDF});
+HOOK_SCRIPT = r"""
+'use strict';
 
-Interceptor.attach(CCKeyDerivationPBKDF, {
-    onEnter: function(args) {
-        this.password = args[0];
-        this.passwordLen = args[1].toInt32();
-        this.salt = args[2];
-        this.saltLen = args[3].toInt32();
-        this.prf = args[4].toInt32();
-        this.rounds = args[5].toInt32();
-        this.derivedKey = args[6];
-        this.derivedKeyLen = args[7].toInt32();
-    },
-    onLeave: function(retval) {
+function findExport(symbol) {
+    var addr = null;
+    Process.enumerateModules().forEach(function (mod) {
+        if (addr) return;
         try {
-            var pw = hexdump(this.password, {length: Math.min(this.passwordLen, 256)});
-            var saltHex = Array.from(new Uint8Array(
-                Memory.readByteArray(this.salt, Math.min(this.saltLen, 32))
-            )).map(function(b){ return ('0' + b.toString(16)).slice(-2); }).join('');
+            mod.enumerateExports().forEach(function (e) {
+                if (e.name === symbol) addr = e.address;
+            });
+        } catch (err) { /* some system modules refuse enumeration */ }
+    });
+    return addr;
+}
 
-            var dkBytes = new Uint8Array(
-                Memory.readByteArray(this.derivedKey, Math.min(this.derivedKeyLen, 64))
-            );
-            var dkHex = Array.from(dkBytes).map(function(b){
-                return ('0' + b.toString(16)).slice(-2);
-            }).join('');
+var target = findExport('CCKeyDerivationPBKDF');
+if (!target) {
+    send({ kind: 'fatal', text: 'CCKeyDerivationPBKDF export not found' });
+} else {
+    send({ kind: 'ready', text: 'hooked at ' + target });
 
-            var entry = {
-                rounds: this.rounds,
-                salt: saltHex,
-                dk: dkHex,
-                dkLen: this.derivedKeyLen
-            };
-            send({type: 'key', data: entry});
-        } catch(e) {
-            send({type: 'error', msg: e.toString()});
-        }
-    }
-});
-"""
-
-# Python frida host script
-FRIDA_HOST = r"""
-import frida
-import json
-import sys
-import time
-
-LOG_FILE = "/tmp/wechat_frida_keys.log"
-WECHAT_PATH = "{wechat_path}"
-
-keys = []
-
-def on_message(message, data):
-    if message['type'] == 'send':
-        payload = message['payload']
-        if payload.get('type') == 'key':
-            keys.append(payload['data'])
-            with open(LOG_FILE, 'a') as f:
-                f.write(json.dumps(payload['data']) + '\n')
-            print(f"  [KEY] rounds={payload['data']['rounds']} salt={payload['data']['salt'][:16]}... dk={payload['data']['dk'][:16]}...")
-        elif payload.get('type') == 'status':
-            print(f"  {payload['msg']}")
-        elif payload.get('type') == 'error':
-            print(f"  [ERROR] {payload['msg']}")
-    elif message['type'] == 'error':
-        print(f"  [FRIDA ERROR] {message.get('description', message)}")
-
-JS_CODE = '''{js_code}'''
-
-print("  正在启动微信...")
-device = frida.get_local_device()
-pid = device.spawn([WECHAT_PATH])
-device.resume(pid)
-time.sleep(3)
-session = device.attach(pid)
-script = session.create_script(JS_CODE)
-script.on('message', on_message)
-script.load()
-
-print("  微信已启动，请登录微信。")
-print("  登录后等待30秒，密钥会在启动时自动捕获...")
-print(f"  密钥日志: {LOG_FILE}")
-
-for i in range(90, 0, -1):
-    time.sleep(1)
-    if i % 15 == 0:
-        print(f"  剩余 {i} 秒... (已捕获 {len(keys)} 个密钥)")
-
-print(f"\\n  共捕获 {len(keys)} 个密钥")
-session.detach()
+    Interceptor.attach(target, {
+        onEnter: function (args) {
+            this.saltPtr = args[2];
+            this.saltLen = args[3].toInt32();
+            this.rounds = args[5].toInt32();
+            this.outPtr = args[6];
+            this.outLen = args[7].toInt32();
+        },
+        onLeave: function () {
+            try {
+                var toHex = function (buf) {
+                    return Array.from(new Uint8Array(buf))
+                        .map(function (b) { return ('0' + b.toString(16)).slice(-2); })
+                        .join('');
+                };
+                var record = {
+                    kind: 'derived_key',
+                    salt: toHex(Memory.readByteArray(this.saltPtr, Math.min(this.saltLen, 32))),
+                    rounds: this.rounds,
+                    key: toHex(Memory.readByteArray(this.outPtr, Math.min(this.outLen, 64))),
+                };
+                send(record);
+            } catch (err) {
+                send({ kind: 'error', text: String(err) });
+            }
+        },
+    });
+}
 """
 
 
-def run_cmd(cmd, check=True):
-    """Run a shell command and return output"""
+def log(msg):
+    print(f"  {msg}")
+
+
+def step(n, total, title):
+    print(f"\n[{n}/{total}] {title}")
+
+
+def sh(cmd, allow_fail=False):
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if check and result.returncode != 0:
-        print(f"  [ERROR] {cmd}")
-        print(f"  {result.stderr.strip()}")
+    if result.returncode != 0 and not allow_fail:
+        log(f"命令失败: {cmd}")
+        log(result.stderr.strip())
         sys.exit(1)
     return result.stdout.strip()
 
 
-def check_env():
-    """Step 1: Check prerequisites"""
-    print("\n[1/5] 检查环境...")
-
+def ensure_macos_wechat():
     if sys.platform != "darwin":
-        print("  [ERROR] 仅支持 macOS")
+        log("此脚本仅支持 macOS")
         sys.exit(1)
-
-    if not os.path.exists(WECHAT_APP):
-        print(f"  [ERROR] 未找到微信: {WECHAT_APP}")
-        print("  请确认已安装微信 Mac 版")
+    if not os.path.isdir(APP_ORIGINAL):
+        log(f"未检测到微信: {APP_ORIGINAL}")
         sys.exit(1)
-    print("  ✓ 微信已安装")
-
-    # Check Python version
-    if sys.version_info < (3, 9):
-        print(f"  [ERROR] Python 版本过低: {sys.version}，需要 3.9+")
-        sys.exit(1)
-    print(f"  ✓ Python {sys.version_info.major}.{sys.version_info.minor}")
-
-    return True
+    log("环境检查通过")
 
 
-def prepare_wechat():
-    """Step 2: Copy and codesign WeChat"""
-    print("\n[2/5] 准备微信签名副本...")
-
-    if os.path.exists(WECHAT_COPY):
-        existing_sig = run_cmd(f"codesign -dv {WECHAT_COPY} 2>&1 | grep 'Signature'", check=False)
-        print("  ✓ 签名副本已存在")
-    else:
-        print(f"  复制微信到 {WECHAT_COPY}...")
-        shutil.copytree(WECHAT_APP, WECHAT_COPY, symlinks=True)
-
-    print("  重新签名（去掉 Hardened Runtime）...")
-    run_cmd(f"codesign --force --deep --sign - {WECHAT_COPY}")
-    print("  ✓ 签名完成")
+def ensure_resigned_copy():
+    """App Store 版微信开了 Hardened Runtime，frida 无法直接注入，
+    需要一份去掉该保护的签名副本才能 attach。"""
+    if not os.path.isdir(APP_RESIGNED):
+        log(f"复制微信到 {APP_RESIGNED} ...")
+        shutil.copytree(APP_ORIGINAL, APP_RESIGNED, symlinks=True)
+    sh(f'codesign --force --deep --sign - "{APP_RESIGNED}"')
+    log("已生成可注入的签名副本")
 
 
-def install_frida():
-    """Step 3: Check/install frida"""
-    print("\n[3/5] 检查 frida...")
-
+def ensure_frida():
     try:
-        import frida
-        print(f"  ✓ frida 已安装 (版本: {frida.__version__})")
-        return True
+        import frida  # noqa: F401
+        log(f"frida 已就绪 ({frida.__version__})")
     except ImportError:
-        pass
-
-    print("  正在安装 frida...")
-    run_cmd(f"{sys.executable} -m pip install frida frida-tools")
-    print("  ✓ frida 安装完成")
-    return True
+        log("安装 frida ...")
+        sh(f"{sys.executable} -m pip install frida frida-tools")
 
 
-def extract_keys():
-    """Step 4: Run frida to extract keys"""
-    print("\n[4/5] 提取密钥...")
+def capture_pbkdf2_calls(wait_seconds=90):
+    """启动签名副本、注入 hook，把用户登录期间触发的每一次 PBKDF2
+    调用（salt + 派生密钥）追加写到 CAPTURE_LOG。"""
+    import frida
 
-    # Kill existing WeChat
-    run_cmd("killall WeChat 2>/dev/null", check=False)
+    sh("killall WeChat", allow_fail=True)
     time.sleep(2)
 
-    # Clear previous log
-    if os.path.exists(FRIDA_LOG):
-        os.remove(FRIDA_LOG)
+    if os.path.exists(CAPTURE_LOG):
+        os.remove(CAPTURE_LOG)
 
-    # Write frida host script
-    wechat_binary = os.path.join(WECHAT_COPY, "Contents", "MacOS", "WeChat")
-    js_code_escaped = FRIDA_JS.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
-    host_script = FRIDA_HOST.replace("{wechat_path}", wechat_binary).replace("{js_code}", js_code_escaped)
+    binary = os.path.join(APP_RESIGNED, "Contents", "MacOS", "WeChat")
+    device = frida.get_local_device()
+    pid = device.spawn([binary])
+    session = device.attach(pid)
+    script = session.create_script(HOOK_SCRIPT)
 
-    host_path = "/tmp/wechat_frida_host.py"
-    with open(host_path, "w") as f:
-        f.write(host_script)
+    captured = []
 
-    print("  启动 frida hook...")
-    print("  " + "=" * 50)
-    try:
-        subprocess.run([sys.executable, host_path], check=True)
-    except KeyboardInterrupt:
-        print("\n  用户中断")
-    print("  " + "=" * 50)
+    def on_message(message, _data):
+        if message.get("type") != "send":
+            if message.get("type") == "error":
+                log(f"[frida] {message.get('description', message)}")
+            return
+        payload = message["payload"]
+        kind = payload.get("kind")
+        if kind == "derived_key":
+            captured.append(payload)
+            with open(CAPTURE_LOG, "a") as f:
+                f.write(json.dumps(payload) + "\n")
+        elif kind in ("ready", "fatal", "error"):
+            log(f"[hook] {payload.get('text')}")
 
-    if not os.path.exists(FRIDA_LOG):
-        print("  [ERROR] 未捕获到任何密钥。请确认已登录微信。")
+    script.on("message", on_message)
+    script.load()
+    device.resume(pid)
+
+    log("微信已启动 — 请登录并保持前台，密钥会在建库/开库时自动被捕获")
+    for remaining in range(wait_seconds, 0, -1):
+        time.sleep(1)
+        if remaining % 15 == 0:
+            log(f"倒计时 {remaining}s，已捕获 {len(captured)} 次派生调用")
+
+    session.detach()
+
+    if not captured:
+        log("没有捕获到任何 PBKDF2 调用，请确认微信已登录成功后重试")
         sys.exit(1)
-
-    # Parse captured keys
-    keys = []
-    with open(FRIDA_LOG) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    keys.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-
-    print(f"  ✓ 共捕获 {len(keys)} 个密钥")
-    return keys
+    log(f"共捕获 {len(captured)} 次密钥派生")
+    return captured
 
 
-def detect_databases():
-    """Auto-detect WeChat database paths and wxid"""
-    print("\n[5/5] 匹配密钥到数据库...")
+def file_salt(db_path):
+    """SQLCipher 4：db 文件的前 16 字节就是明文 salt。"""
+    with open(db_path, "rb") as f:
+        return f.read(16).hex()
 
-    # Find wxid directories
-    pattern = os.path.join(WECHAT_BASE, "*/db_storage")
-    db_dirs = glob.glob(pattern)
 
-    if not db_dirs:
-        print(f"  [ERROR] 未找到微信数据库目录")
-        print(f"  搜索路径: {pattern}")
-        sys.exit(1)
+def match_keys_to_dbs(db_base, captured):
+    """按 salt 精确匹配——不同数据库用不同 salt 派生密钥，
+    不能只按 rounds/长度粗筛，否则会把密钥错配给别的库。"""
+    by_salt = {entry["salt"]: entry for entry in captured if entry.get("rounds") == 256000}
 
-    # Use the first (usually only) wxid directory
-    db_base = db_dirs[0]
-    wxid = db_base.split("/xwechat_files/")[1].split("/")[0]
-    print(f"  ✓ 检测到 wxid: {wxid}")
-    print(f"  ✓ 数据库路径: {db_base}")
-
-    # Load captured keys
-    keys = []
-    with open(FRIDA_LOG) as f:
-        for line in f:
-            try:
-                keys.append(json.loads(line.strip()))
-            except:
-                continue
-
-    # Match keys to databases by salt
-    db_files = {
-        "message_0": os.path.join(db_base, "message", "message_0.db"),
-        "contact": os.path.join(db_base, "contact", "contact.db"),
-        "session": os.path.join(db_base, "session", "session.db"),
-    }
-
-    result = {}
-    for db_name, db_path in db_files.items():
+    resolved = {}
+    for name, rel_path in TARGET_DBS.items():
+        db_path = os.path.join(db_base, rel_path)
         if not os.path.exists(db_path):
-            print(f"  [WARN] 数据库不存在: {db_path}")
+            log(f"跳过 {name}：文件不存在 ({db_path})")
             continue
 
-        # Read first page salt (bytes 4080-4096 of the file, which is the reserve area)
-        with open(db_path, "rb") as f:
-            header = f.read(4096)
+        salt = file_salt(db_path)
+        entry = by_salt.get(salt)
+        if entry is None:
+            log(f"{name}: salt {salt[:12]}... 未匹配到任何捕获的密钥")
+            continue
 
-        # The salt is in the reserve area: page[4096-80:4096-80+16] = page[4016:4032]
-        # But for SQLCipher, the salt is actually at the very end of page 0's reserve
-        # More precisely, salt = first 16 bytes of the file (for SQLCipher 4)
-        file_salt = header[:16].hex()
+        resolved[name] = entry["key"]
+        log(f"{name}: 已匹配 (salt {salt[:12]}...)")
 
-        # Try to match: for each key, check if its derived key can decrypt page 0
-        # Simpler approach: try each captured key against each DB
-        matched = False
-        for key_entry in keys:
-            if key_entry.get("rounds") == 256000 and key_entry.get("dkLen") in (48, 64):
-                dk = key_entry["dk"]
-                # Store the first 32 bytes (256 bits) as the AES key
-                if len(dk) >= 64:
-                    result[db_name] = dk[:64]
-                    matched = True
-                    break
+    return resolved
 
-        if matched:
-            print(f"  ✓ {db_name}.db → 密钥已匹配")
-        else:
-            print(f"  [WARN] {db_name}.db 未匹配到密钥")
 
-    if not result:
-        print("\n  [ERROR] 未能匹配任何密钥到数据库")
-        print("  请确认：")
-        print("  1. 已正常登录微信")
-        print("  2. 微信版本为 Mac 4.x")
+def locate_account():
+    candidates = glob.glob(os.path.join(CONTAINER_ROOT, "*/db_storage"))
+    if not candidates:
+        log(f"未在 {CONTAINER_ROOT} 下找到任何账号的 db_storage 目录")
         sys.exit(1)
+    db_base = candidates[0]
+    wxid = os.path.basename(os.path.dirname(db_base))
+    return wxid, db_base
 
-    # Save keys
-    os.makedirs(os.path.dirname(KEYS_FILE), exist_ok=True)
+
+def persist(wxid, db_base, keys):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
     with open(KEYS_FILE, "w") as f:
-        json.dump(result, f, indent=2)
-    print(f"\n  ✓ 密钥已保存到 {KEYS_FILE}")
+        json.dump(keys, f, indent=2)
+    log(f"密钥写入 {KEYS_FILE}")
 
-    # Also create/update config with detected paths
     config = {}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
             config = json.load(f)
-
     config["wxid"] = wxid
     config["db_base_path"] = db_base
-
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
-    print(f"  ✓ 配置已更新 {CONFIG_FILE}")
-
-    return result
+    log(f"配置写入 {CONFIG_FILE}")
 
 
 def main():
-    print("=" * 50)
-    print("微信 Mac 4.x 数据库密钥提取工具")
-    print("=" * 50)
+    print("微信 Mac 4.x 密钥提取")
+    total_steps = 5
 
-    check_env()
-    prepare_wechat()
-    install_frida()
-    extract_keys()
-    detect_databases()
+    step(1, total_steps, "环境检查")
+    ensure_macos_wechat()
 
-    print("\n" + "=" * 50)
-    print("密钥提取完成！")
-    print(f"  密钥文件: {KEYS_FILE}")
-    print(f"  配置文件: {CONFIG_FILE}")
-    print("\n接下来请在 Claude Code 中说 '日报' 来配置监控群聊。")
-    print("=" * 50)
+    step(2, total_steps, "准备可注入的签名副本")
+    ensure_resigned_copy()
+
+    step(3, total_steps, "检查 frida")
+    ensure_frida()
+
+    step(4, total_steps, "捕获 PBKDF2 密钥派生")
+    captured = capture_pbkdf2_calls()
+
+    step(5, total_steps, "按 salt 匹配密钥并写入配置")
+    wxid, db_base = locate_account()
+    log(f"账号: {wxid}")
+    keys = match_keys_to_dbs(db_base, captured)
+    if not keys:
+        log("未能匹配到任何目标数据库的密钥，请重试（确保完整登录流程走完）")
+        sys.exit(1)
+    persist(wxid, db_base, keys)
+
+    print("\n完成。接下来在 Claude Code 里说「日报」即可继续配置监控群聊。")
 
 
 if __name__ == "__main__":
