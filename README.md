@@ -16,7 +16,7 @@
 ### 方式一：从 GitHub 安装（推荐）
 
 ```bash
-npx skills add mcncarl/yichen-skills
+npx skills add Rouen007/wechat-daily-skill
 ```
 
 安装后在 Claude Code 中手动启用 wechat-daily skill。
